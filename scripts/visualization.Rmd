@@ -1,0 +1,1618 @@
+---
+title: "asthma_drugs"
+author: "tayaza"
+date: "16/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# R 4.1.0
+knitr::opts_chunk$set(echo = TRUE)
+install.packages("pacman")
+library(pacman)
+pacman::p_load(tidyverse, ggpubr, VennDiagram, devtools,
+               formatR, futile.logger,)
+devtools::install_github("wtcooper/icdcoder")
+devtools::install_github("G-Thomson/Manu")
+library(icdcoder)
+library(Manu)
+
+```
+
+```{r setup-color-scheme, fig.height=.5, fig.width=1}
+hoiho <- get_pal("Hoiho")
+color.list <- list(blood=hoiho[1],
+                   lung=hoiho[5],
+                   gwas="gray80",
+                   lung_dark="#996666",
+                   blood_dark=hoiho[2])
+print_pal(hoiho)
+```
+
+
+
+# Parsing inputs
+
+```{r read-drug-associations, include=FALSE}
+# Read drug response associations from GWAS and doi.org/10.3389/fphar.2019.00520
+drugs <- read_tsv("../analysis/data_tidying/drug_response_combined_curated.txt") %>% 
+  filter(!is.na(SNP)) %>% 
+   mutate(
+    SNP = case_when(
+      SNP =="rs2412222" ~ "rs321081", # Merged rsID
+      TRUE ~ as.character(SNP)))
+```
+
+
+```{r resolve-gene-range-in-gwas}
+
+resolve_genes_range <- function(df) {
+  # Some SNPs are mapped to a range of genes instead of a single gene. 
+  # This function identifies all genes within that range.
+  res.df <- tibble()
+  gene.ref <- read_tsv("../data/gene_reference.bed",
+                       col_names = c("chrom", "start", "end", "gene", "gencode_id"))
+    for (i in 1:length(df$Gene)) {
+      first_gene <- ""
+      second_gene <- ""
+      if (str_detect(df$Gene[i], " - ")) {
+        first_gene <- str_split(df$Gene[i], " - ", simplify = T)[[1]]
+        second_gene <- str_split(df$Gene[i], " - ", simplify = T)[[2]]
+      }else if (str_detect(df$Gene[i], ", ")) {
+        first_gene <- str_split(df$Gene[i], ", ", simplify = T)[[1]]
+        second_gene <- str_split(df$Gene[i], ", ", simplify = T)[[2]]
+      }
+      first_gene_df <- gene.ref %>% filter(gene == first_gene)
+      second_gene_df <- gene.ref %>% filter(gene == second_gene)
+      if (dim(first_gene_df)[1] == 0  | dim(second_gene_df)[1] == 0) {
+        to.res <- df[i,] %>% mutate(
+          Gene = NULL,
+          n = 2) %>%
+          uncount(n) %>%
+          add_column(Gene = c(first_gene, second_gene))
+        res.df <- res.df %>% bind_rows(to.res)
+      } else {
+        positions <- c(first_gene_df$start, first_gene_df$end, second_gene_df$start, second_gene_df$end)
+        overlapping.genes <- gene.ref %>%
+        filter(chrom == first_gene_df$chrom &
+               end >= min(positions) &
+               start <= max(positions)) %>% distinct(gene)
+        to.res <- df[i,] %>% mutate(
+          Gene = NULL,
+          n = length(overlapping.genes$gene)) %>%
+          uncount(n) %>%
+          add_column(Gene = overlapping.genes$gene)
+        res.df <- res.df %>% bind_rows(to.res)
+        }
+  }
+  return(res.df %>% distinct())
+}
+```
+
+
+```{r, include=FALSE}
+drugs.resolved.gene_range <-  resolve_genes_range(drugs %>% filter(grepl("-", Gene) | grepl(", ", Gene))) %>% 
+  bind_rows(drugs %>% filter(!grepl("-", Gene) & !grepl(",", Gene)))
+
+# drugs.resolved.gene_range %>% 
+#   write_tsv("../analysis/data_tidying/drug_response_combined_curated_resolved_gene_range.txt")
+```
+
+
+```{r read-gtex-expression-data, include=FALSE}
+# Read gtex expression data
+gene.expression <- vroom::vroom(
+  "../data/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_median_tpm.gct.gz", 
+  col_select = c(`Description`, `Lung`, `Whole Blood`), delim="\t", skip=2) 
+```
+
+
+```{r read-gtex-blood-eqtls, include=FALSE}
+
+gtex.blood <- read_tsv("../results/unconstrained/blood/gtex_sig_cis_eqtls_Whole_Blood.tsv") %>% 
+   left_join(drugs.resolved.gene_range %>% distinct(SNP, Drug, Gene), by=c("snp"="SNP")) %>% 
+   filter(!is.na(Drug)) %>% #Associations with no Drug are from GWAS unrelated to drug response.
+  mutate(
+    match = case_when(
+      gene == Gene ~ "matched",
+      gene != Gene ~ "unmatched"
+    ),
+      pair = paste0(snp, "_", gene)
+  ) %>%
+  arrange(pair, match, desc(match="matched")) %>% 
+  distinct(pair, .keep_all = TRUE) %>% 
+  left_join(
+    gene.expression %>% select(Description, `Whole Blood`) %>% rename("expression"="Whole Blood"),
+    by=c("gene"="Description")
+  )
+```
+
+
+
+```{r read-spatial-blood-eqtls, include=FALSE}
+spatial.blood <- read_tsv("../results/constrained/blood/significant_eqtls.txt") %>% 
+   left_join(drugs.resolved.gene_range %>% distinct(SNP, Drug, Gene), by=c("snp"="SNP")) %>% 
+   filter(!is.na(Drug)) %>% #Associations with no Drug are from GWAS unrelated to drug response.
+  mutate(
+    match = case_when(
+      gene == Gene ~ "matched",
+      gene != Gene ~ "unmatched"
+    ),
+      pair = paste0(snp, "_", gene)
+  ) %>%
+  arrange(pair, match, desc(match="matched")) %>% 
+  distinct(pair, .keep_all = TRUE)
+```
+
+
+```{r read-gtex-lung-eqtls, include=FALSE}
+gtex.lung <- read_tsv("../results/unconstrained/lung/gtex_sig_cis_eqtls_Lung.tsv") %>% 
+  left_join(drugs.resolved.gene_range %>% distinct(SNP, Drug, Gene), by=c("snp"="SNP")) %>% 
+   filter(!is.na(Drug)) %>% #Associations with no Drug are from GWAS unrelated to drug response.
+  mutate(
+    match = case_when(
+      gene == Gene ~ "matched",
+      gene != Gene ~ "unmatched"
+    ),
+      pair = paste0(snp, "_", gene)
+  ) %>%
+  arrange(pair, match, desc(match="matched")) %>% 
+  distinct(pair, .keep_all = TRUE) %>% 
+  left_join(
+    gene.expression %>% select(Description, `Whole Blood`) %>% rename("expression"="Whole Blood"),
+    by=c("gene"="Description")
+  )
+```
+
+
+```{r read-spatial-lung-eqtls, include=FALSE}
+spatial.lung <- read_tsv("../results/constrained/lung/significant_eqtls.txt") %>% 
+  left_join(drugs.resolved.gene_range %>% distinct(SNP, Drug, Gene), by=c("snp"="SNP")) %>% 
+   filter(!is.na(Drug)) %>% #Associations with no Drug are from GWAS unrelated to drug response.
+  mutate(
+    match = case_when(
+      gene == Gene ~ "matched",
+      gene != Gene ~ "unmatched"
+    ),
+      pair = paste0(snp, "_", gene)
+  ) %>%
+  arrange(pair, match, desc(match="matched")) %>% 
+  distinct(pair, .keep_all = TRUE) 
+```
+
+
+
+```{r write-gtex-pairs-for-afc-calc}
+
+# GTEx cis permutations do not have aFC. This output file is used to calculate
+# aFC using CoDeS3D.
+gtex.blood %>% distinct(variant_id, gene_id, tissue) %>% 
+  bind_rows(gtex.lung %>% distinct(variant_id, gene_id, tissue)) %>% 
+  rename("sid"="variant_id", "pid"="gene_id") %>% 
+  separate(sid, into = c("sid_chr", "sid_pos", NA, NA, NA), remove = F) #%>% 
+  # write_tsv("../drugs/gtex_eqtls_for_afc.txt")
+
+```
+
+```{r calc-unconstrained-afc}
+# Use CoDeS3D for this. 
+#Results to be written to "../results/unconstrained/eqtls_afc.txt"
+```
+
+
+## Supplementary Table 4: Constrained eQTLs in the blood and lung
+```{r write-constrained-eqtls}
+spatial.blood %>% 
+  bind_rows(spatial.lung) %>% 
+  select(-Gene, -pair) %>% 
+  rename_all(tolower) %>% 
+  mutate(match = ifelse(match == "matched", TRUE, FALSE)) %>% 
+  rename(match_obs_study = match) %>% 
+  mutate(method = "constrained") %>% 
+  relocate(match_obs_study, .after = gene) %>% 
+  write_tsv("../analysis/data_tidying/constrained_eqtls.txt")
+```
+
+
+## Supplementary Table 5: Unconstrained eQTLs in the blood and lung
+```{r}
+read_tsv("../results/unconstrained/eqtls_afc.txt") %>% 
+  inner_join(
+    gtex.blood %>% distinct() %>% 
+    bind_rows(gtex.lung %>% distinct()),
+    by = c("sid"="variant_id", "pid"="gene_id", "tissue"="tissue")) %>% 
+  select(snp, gene, tissue, log2_aFC, log2_aFC_lower, log2_aFC_upper, pair) %>% 
+  mutate(method="unconstrained") %>% 
+  inner_join(
+    gtex.blood %>% 
+      bind_rows(gtex.lung)
+  ) %>%  
+  select(snp, gene, match, tissue, log2_aFC, log2_aFC_lower, log2_aFC_upper, 
+         method, variant_id, gene_id, tss_distance, maf, Drug, expression) %>% 
+  rename_all(tolower) %>% 
+  mutate(match = ifelse(match == "matched", TRUE, FALSE)) %>%
+  rename(match_obs_study = match) %>% 
+  write_tsv("../analysis/data_tidying/unconstrained_eqtls.txt")
+```
+
+
+
+```{r read-unconstrained-afc, include=FALSE}
+afc <- read_tsv("../results/unconstrained/eqtls_afc.txt") %>% 
+  inner_join(
+    gtex.blood %>% distinct() %>% 
+    bind_rows(gtex.lung %>% distinct()),
+    by = c("sid"="variant_id", "pid"="gene_id", "tissue"="tissue")) %>% 
+  select(snp, gene, tissue, log2_aFC, pair) %>% 
+  mutate(method="GTEx") %>% 
+  bind_rows(
+    spatial.blood %>% select(snp, gene, tissue, log2_aFC, pair) %>% 
+  bind_rows(spatial.lung %>% select(snp, gene, tissue, log2_aFC, pair)) %>% 
+  mutate(method="Spatial")
+  )
+```
+
+
+
+```{r combine-eqtls}
+eqtls <- spatial.blood %>% 
+  mutate(method = "spatial") %>% 
+  bind_rows(
+    gtex.blood %>% 
+      mutate(method = "gtex")
+  ) %>% 
+  bind_rows(
+   spatial.lung %>% 
+      mutate(method = "spatial")
+  ) %>% 
+  bind_rows(
+    gtex.lung %>% 
+      mutate(method = "gtex")
+  ) 
+```
+
+## SNP annotations
+```{r, include=FALSE}
+annotations <- read_tsv("../results/haploreg/drug_response_combined_haploreg.txt") %>% 
+  filter(rsID == query_snp_rsid) %>% 
+  select(rsID, Chromatin_Marks, Motifs, dbSNP_functional_annotation) %>% 
+  mutate(annotation = case_when(
+    is.na(dbSNP_functional_annotation) ~ "Not annotated",
+    dbSNP_functional_annotation == "INT" ~ "Intronic",
+    dbSNP_functional_annotation == "." ~ "Intergenic",
+    dbSNP_functional_annotation == "U3" ~ "3 prime UTR",
+    dbSNP_functional_annotation == "U5" ~ "5 prime UTR",
+    grepl("SYN", dbSNP_functional_annotation) ~ "Synonymous",
+    grepl("NSM", dbSNP_functional_annotation) ~ "Non-synonymous",
+    
+  ))
+
+```
+
+
+```{r annotation-snp-gtex}
+annotations.gtex.snps <- gtex.blood %>% 
+  left_join(annotations %>% select(rsID, annotation), by=c("snp"="rsID")) %>% 
+  distinct(across(snp), .keep_all = TRUE) %>% 
+  count(annotation) %>% 
+     mutate(
+    prop = n / gtex.blood %>% select(snp) %>% n_distinct (),
+    tissue = "Whole_Blood",
+    category = "Blood_unconstrained") %>% 
+ bind_rows(
+    gtex.lung %>% 
+  left_join(annotations %>% select(rsID, annotation), by=c("snp"="rsID")) %>% 
+  distinct(across(snp), .keep_all = TRUE) %>% 
+  count(annotation) %>% 
+     mutate(
+    prop = n / gtex.lung %>% select(snp) %>% n_distinct (),
+    tissue = "Lung",
+    category = "Lung_unconstrained")
+  ) %>% 
+  mutate(
+    annotation = replace_na(annotation, "Not annotated")
+    )
+```
+
+
+```{r annotation-snp-spatial}
+annotation.spatial.snps <- spatial.blood %>% 
+  left_join(annotations %>% select(rsID, annotation), by=c("snp"="rsID")) %>% 
+  distinct(across(snp), .keep_all = TRUE) %>% 
+  count(annotation) %>% 
+     mutate(
+    prop = n / gtex.blood %>% select(snp) %>% n_distinct (),
+    tissue = "Whole_Blood",
+    category = "Blood_constrained") %>% 
+ bind_rows(
+    spatial.lung %>% 
+  left_join(annotations %>% select(rsID, annotation), by=c("snp"="rsID")) %>% 
+  distinct(across(snp), .keep_all = TRUE) %>% 
+  count(annotation) %>% 
+     mutate(
+    prop = n / gtex.lung %>% select(snp) %>% n_distinct (),
+    tissue = "Lung",
+    category = "Lung_constrained")
+  ) %>% 
+  mutate(
+    annotation = replace_na(annotation, "Not annotated")
+    )
+```
+
+
+
+## eQTL interactions
+
+```{r interactions-blood}
+interactions.blood <-  gtex.blood %>% 
+  select(snp, gene, pair) %>% 
+  mutate(
+    method = "GTEx_Blood",
+    interaction_type = "Cis") %>% 
+    distinct() %>% 
+  bind_rows(
+    spatial.blood %>% 
+  select(snp, gene, pair, interaction_type) %>% 
+  mutate(
+    method = "Spatial_Blood") %>% 
+    distinct()) %>% 
+    count(method, interaction_type) %>% 
+  mutate(tissue = "Whole_Blood")
+```
+
+
+```{r interactions-lung}
+interactions.lung <-  gtex.lung %>% 
+  select(snp, gene, pair) %>% 
+  mutate(
+    method = "GTEx_Lung",
+    interaction_type = "Cis") %>% 
+    distinct() %>% 
+  bind_rows(
+    spatial.lung %>% 
+      select(snp, gene, pair, interaction_type) %>% 
+      mutate(method = "Spatial_Lung") %>% 
+      distinct()
+    ) %>% 
+    count(method, interaction_type) %>% 
+  mutate(tissue = "Lung")
+```
+
+
+## Gene annotations
+```{r, include=FALSE}
+# The file `gene_annotations.txt` is the output of `get_gene_type.py`
+gencode <- read_tsv("../analysis/data_tidying/gene_annotations.txt") #%>%
+```
+
+
+
+# Variants associated with drug response in asthma mark expression quantitative trait loci in the lung and blood
+## Figure 1a [top left]: DRA-eQTLs identified in the blood
+```{r plot-blood-snps-venn, include=FALSE}
+venn.diagram(
+  list(spatial = unique(spatial.blood$snp),
+       gtex = unique(gtex.blood$snp)), 
+  filename = "../figures/venns/venn_blood_snps.tiff",
+  category.names = c("", ""),
+  fill = c(hoiho[2], color.list$blood),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+## Figure 1a [top right]: DRA-eQTLs identified in the lung
+```{r plot-lung-snps-venn, include=FALSE}
+venn.diagram(
+  list(spatial = unique(spatial.lung$snp),
+       gtex = unique(gtex.lung$snp)), 
+  filename = "../figures/venns/venn_lung_snps.tiff",
+  category.names = c("", ""),
+  fill = c("#996666", color.list$lung),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+## Figure 1a [bottom left]: Compare unconstrained DRA-eQTLs between tissues
+```{r plot-unconstrained-snps-venn, include=FALSE}
+
+venn.diagram(
+  list(
+     blood = unique(gtex.blood$snp),
+     lung = unique(gtex.lung$snp)),
+  filename = "../figures/venns/venn_gtex_snps.tiff",
+  category.names = c("", ""),
+  fill = c(color.list$blood, color.list$lung),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+## Figure 1a [bottom right]: Compare constrained DRA-eQTLs between tissues
+```{r plot-constrained-snps-venn, include=FALSE}
+venn.diagram(
+  list(
+    blood = unique(spatial.blood$snp),
+    lung = unique(spatial.lung$snp)),
+  filename = "../figures/venns/venn_spatial_snps.tiff",
+  category.names = c("", ""),
+  fill = c(color.list$blood_dark, color.list$lung_dark),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+
+## Figure 1b: eQTL annotations
+```{r plot-snp-annotations}
+annotations.gtex.snps %>% 
+  bind_rows(annotation.spatial.snps) %>% 
+  ggplot(aes(x=fct_reorder(annotation, prop), y=prop, fill=category, label=n))+
+  geom_col(position = position_dodge(preserve = "single"))+
+  geom_text(position = position_dodge(width = 0.9), hjust=1.2)+
+  scale_x_discrete("")+
+  scale_y_continuous("Proportion of SNPs")+
+  scale_fill_manual(values=c(color.list$blood_dark, color.list$blood, color.list$lung_dark, color.list$lung))+
+  coord_flip()+
+  theme_minimal()+
+  theme(legend.position = "bottom")+
+  facet_grid(. ~ factor(tissue, levels = c("Whole_Blood", "Lung")))#+
+  # ggsave("../drugs/figures/snps_annotation.pdf", width=8, height=5)
+```
+
+
+
+## Figure 1c [upper left]: Compare constrained and unconstrained eQTL interactions in blood
+```{r interactions-blood-all}
+venn.diagram(list(
+  spatial = unique(spatial.blood$pair), 
+  gtex = unique(gtex.blood$pair)),
+  filename = "../drugs/figures/venns/venn_blood_pairs_all.tiff",
+  category.names = c("", ""),
+  fill = c(hoiho[2], color.list$blood),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+## Figure 1c [upper right]: Compare constrained and unconstrained eQTL interactions in lung
+```{r interactions-lung-all}
+venn.diagram(list(
+  spatial = unique(spatial.lung$pair), 
+  gtex = unique(gtex.lung$pair)),
+  filename = "../drugs/figures/venns/venn_lung_pairs_all.tiff",
+  category.names = c("", ""),
+  fill = c("#996666", color.list$lung),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+## Figure 1c [bottom left]: Compare unconstrained tissue eQTL interactions
+```{r plot-unconstrained-interactions-venn, include=FALSE}
+
+venn.diagram(list(
+  blood = unique(gtex.blood$pair),
+  lung = unique(gtex.lung$pair)),
+  filename = "../drugs/figures/venns/venn_unconstrained_pairs.tiff",
+  category.names = c("", ""),
+  fill = c(color.list$blood, color.list$lung),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+## Figure 1c [bottom right]: Compare constrained tissue eQTL interactions
+```{r plot-constrained-interactions-venn, include=FALSE}
+
+venn.diagram(list(
+  blood = unique(spatial.blood$pair),
+  lung = unique(spatial.lung$pair)),
+  filename = "../drugs/figures/venns/venn_constrained_pairs.tiff",
+  category.names = c("", ""),
+  fill = c(color.list$blood_dark, color.list$lung_dark),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+
+
+## Figure 1d: Types of eQTL interactions in the blood and lung 
+```{r plot-interactions-by-tissue}
+interactions.blood %>% bind_rows(interactions.lung) %>% 
+  ggplot(aes(x=fct_reorder(interaction_type, -n), y=n, fill=method))+
+  geom_col(position = position_dodge2(preserve = "single"))+
+  scale_x_discrete("")+
+  scale_y_continuous("eSNP-eGene interactions")+
+  scale_fill_manual(values = c(color.list$blood, color.list$lung, color.list$blood_dark,  color.list$lung_dark))+
+  coord_flip()+
+  theme_minimal()+
+  theme(legend.position = "bottom")+
+  facet_grid(. ~ factor(tissue, levels = c("Whole_Blood", "Lung")))#+
+  # ggsave("../drugs/figures/eqtl_interactions.pdf", width=8, height=5)
+  
+```
+
+
+
+```{r}
+# gtex.blood %>% 
+#   distinct(gene, gene_id) %>% 
+#   bind_rows(
+#     spatial.blood %>% 
+#       distinct(gene, gencode_id) %>% 
+#      rename("gene_id"="gencode_id")) %>% 
+#   bind_rows(
+#     gtex.lung %>%  
+#       distinct(gene, gene_id)) %>% 
+#   bind_rows(
+#     spatial.lung %>% 
+#       distinct(gene, gencode_id) %>% 
+#       rename("gene_id"="gencode_id")) %>% 
+#   distinct() %>% 
+#   write_tsv("../drugs/gene_ids_symbols.txt")
+```
+
+## Figure 1e [upper left]: Compare constrained and unconstrained DRA-genes in blood
+```{r plot-blood-genes-venn, include=FALSE}
+
+venn.diagram(list(
+  spatial = unique(spatial.blood$gene), 
+  gtex = unique(gtex.blood$gene)),
+  filename = "../drugs/figures/venns/venn_blood_genes.tiff",
+  category.names = c("", ""),
+  fill = c(hoiho[2], color.list$blood),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+## Figure 1e [upper left]: Compare constrained and unconstrained DRA-genes in lung
+```{r plot-lung-genes-venn, include=FALSE}
+
+venn.diagram(list(
+  spatial = unique(spatial.lung$gene), 
+  gtex = unique(gtex.lung$gene)),
+  filename = "../drugs/figures/venns/venn_lung_genes.tiff",
+  category.names = c("", ""),
+  fill = c("#996666", color.list$lung),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+## Figure 1e [bottom left]: Compare unconstrained tissue DRA-genes
+```{r plot-gtex-blood-lung}
+venn.diagram(
+  list(
+  blood = unique(gtex.blood$gene),
+  spatial = unique(gtex.lung$gene)),
+  filename = "../drugs/figures/venns/venn_gtex_genes.tiff",
+  category.names = c("", ""),
+ fill = c(color.list$blood, color.list$lung),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+
+## Figure 1e [bottom right]: Compare constrained tissue DRA-genes
+```{r plot-spatial-blood-lung}
+venn.diagram(
+  list(
+  blood = unique(spatial.blood$gene),
+  spatial = unique(spatial.lung$gene)),
+  filename = "../drugs/figures/venns/venn_spatial_genes.tiff",
+  category.names = c("", ""),
+   fill = c(color.list$blood_dark, color.list$lung_dark),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+
+## Figure 1f: DRA-gene annotations
+```{r}
+gtex.blood %>% 
+  distinct(gene, tissue) %>% 
+  mutate(category = paste("Unconstrained", tissue, sep = "_")) %>% 
+  bind_rows(
+    spatial.blood %>% 
+      distinct(gene, tissue) %>% 
+      mutate(category = paste("Constrained", tissue, sep = "_"))) %>% 
+  bind_rows(
+    gtex.lung %>%  
+      distinct(gene, tissue) %>% 
+      mutate(category = paste("Unconstrained", tissue, sep = "_"))) %>% 
+  bind_rows(
+    spatial.lung %>% 
+      distinct(gene, tissue) %>% 
+      mutate(category = paste("Constrained", tissue, sep = "_"))) %>% 
+  left_join(gencode, by=c("gene"="gene_name")) %>% 
+  count(tissue, category,gene_type) %>% 
+  ggplot(aes(x=fct_reorder(gene_type, n), y=n, fill=category))+
+  geom_col(position=position_dodge2(preserve="single"))+
+  scale_fill_manual(values = c(color.list$lung_dark, color.list$blood_dark, color.list$lung, color.list$blood))+
+  coord_flip()+
+  theme_minimal()+
+  labs(x = "Gene type", y = "Gene count")+
+  facet_grid(. ~ factor(tissue, levels = c("Whole_Blood", "Lung")))#+
+  # ggsave("../drugs/figures/genes_type_by_methods.pdf", width=8, height=4)
+
+```
+
+
+## Read Haploreg
+
+```{r read-maf-haploreg, include=FALSE}
+maf <- read_tsv("../results/haploreg/drug_response_combined_haploreg.txt") %>% 
+  filter(is_query_snp == 1) %>% 
+  select(rsID, AFR, AMR, ASN, EUR) %>%
+  left_join(drugs %>% select(SNP, Ancestry), by=c("rsID"="SNP")) %>% 
+  filter(!is.na(Ancestry) & rsID %in% afc$snp) %>% 
+  mutate(
+    rsID = factor(rsID),
+    Ancestry = factor(Ancestry)
+  )
+
+
+library(scales)
+
+ancestry.colors <- hue_pal(h=c(0, 360), l=40)(length(levels(maf$Ancestry)))
+names(ancestry.colors) <- levels(maf$Ancestry)
+maf <- maf %>% mutate(
+  c = ancestry.colors[Ancestry]
+)
+
+```
+
+## Supplementary Figure 1a: Proportions of DRA-eQTLs in observational studies
+```{r plot-dra-eqtls-proportions}
+
+afc %>% distinct(snp) %>% 
+  left_join(drugs %>% distinct(SNP, Ancestry), by = c("snp"="SNP")) %>% 
+  count(Ancestry) %>% 
+  mutate(perc = n/sum(n)*100) %>% 
+  ggplot(aes(x="", y=perc, fill=Ancestry))+
+  geom_bar(width=1, stat = "identity")+
+  coord_polar("y", start = 0)+
+  theme_minimal()+
+  theme(
+    axis.text.x=element_blank(),
+     axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.border = element_blank(),
+    panel.grid=element_blank(),
+    axis.ticks = element_blank(),
+    plot.title=element_text(size=14, face="bold"))#+
+   # ggsave("../drugs/figures/maf_pop_pie.pdf", width=6, height=4)
+```
+
+## Supplementary Figure 1b: Median DRA-eQTL MAF across populations
+```{r plot-median-maf}
+maf %>% drop_na() %>% 
+  left_join(drugs %>% select(SNP, Drug), by=c("rsID"="SNP")) %>% 
+  relocate(Drug, .after = rsID) %>% 
+  # filter(Drug == "corticosteroids") %>% 
+  pivot_longer(cols = c(AFR, AMR, ASN, EUR), names_to = "Population", values_to = "MAF") %>% 
+  mutate(
+     study_population = case_when(
+      Ancestry == "European" ~ "EUR",
+      Ancestry %in% c("Chinese", "Japanese", "Korean") ~ "ASN",
+      Ancestry == "Latino" ~ "AMR",
+      Ancestry == "Unspecified" ~ "Unspecified",
+      Ancestry == "European;African;Asian" ~ "EUR|AFR|ASN",
+      Ancestry == "European;Latino;African-American" ~ "EUR|AMR|AFR-AMR",
+    )
+  ) %>% 
+  group_by(Drug, Population, study_population) %>% 
+  summarise(median_maf = median(MAF)) %>% 
+  ungroup() %>% arrange(study_population) %>% 
+  ggplot(aes(x=Population, y=study_population, fill=median_maf))+
+  geom_tile()+
+  scale_fill_gradient2(low="#e5f5f9", high="#2ca25f", limits=c(0, 1))+
+  theme_minimal()+
+  labs(y = "Study population", fill = "Median MAF")+
+  facet_grid(Drug ~ ., scales = "free", space = "free")#+
+  # ggsave("../drugs/figures/maf_median.pdf", width=6, height=4)
+```
+
+## Supplementary Figure 1c: Corticosteroid DRA-eQTLs are most common across populations
+```{r plot-dra-eqtls-maf-box-plot}
+read_tsv("../results/haploreg/drug_response_combined_haploreg.txt") %>% 
+  filter(is_query_snp == 1) %>% 
+  select(rsID, AFR, AMR, ASN, EUR) %>%
+  left_join(drugs %>% select(SNP, Drug, Ancestry), by=c("rsID"="SNP")) %>% 
+  filter(!is.na(Ancestry) & rsID %in% afc$snp) %>% 
+  mutate(
+    rsID = factor(rsID),
+    Ancestry = factor(Ancestry)
+  ) %>% 
+  pivot_longer(cols = c(AFR, AMR, ASN, EUR), names_to = "Population", values_to = "MAF") %>%
+  # filter(Population == "AFR") %>% 
+  ggboxplot(x="Drug", y="MAF", color="Drug")+
+  stat_compare_means(
+    comparisons = list(c("anti-leukotriene agents", "beta-agonists"),
+         c("beta-agonists", "corticosteroids"),
+         c("anti-leukotriene agents", "corticosteroids")))+
+  # stat_compare_means(label.y = 0.2)+
+  # geom_boxplot()+
+  theme_minimal()+
+  theme(legend.position = "bottom",
+        axis.text.x = element_blank())+
+  facet_grid(. ~ Population)#+
+  # ggsave("../figures/maf_boxplot.pdf", width=10, height=4)
+ 
+```
+
+
+
+
+
+# DRA-genes are regulated differently in the lung than in the blood
+
+## Figure 2a [top left]: Compare unconstrained DRA-genes
+```{r plot-unconstrained-genes-cis-venn, include=FALSE}
+
+venn.diagram(
+  list(
+    blood = unique(gtex.blood$gene),
+    lung = unique(gtex.lung$gene)),
+  filename = "../figures/venns/venn_unconstrained_gene_cis.tiff",
+  category.names = c("", ""),
+  fill = c(color.list$blood, color.list$lung),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+
+```
+
+## Figure 2a [top right]: Compare constrained DRA-genes
+```{r plot-constrained-unconstrained-intersect-genes-cis-venn, include=FALSE}
+venn.diagram(
+  list(
+    blood = unique((spatial.blood %>% filter(interaction_type=="Cis"))$gene),
+    lung = unique((spatial.lung %>% filter(interaction_type=="Cis"))$gene)),
+  filename = "../figures/venns/venn_constrained_gene_cis.tiff",
+  category.names = c("", ""),
+  fill = c(color.list$blood_dark, color.list$lung_dark),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1,
+  width = 25, height = 25)
+```
+
+## Figure 2a [bottom centre]: Common DRA-genes identified by constrained and unconstrained methods
+```{r plot-blood-pairs-cis-venn, include=FALSE}
+common_genes_gtex <-  intersect(unique(gtex.blood$gene), unique(gtex.lung$gene))
+common_genes_spatial <- intersect(
+  unique(spatial.blood %>% filter(interaction_type=="Cis"))$gene,
+  unique(spatial.lung %>% filter(interaction_type=="Cis"))$gene)
+common_genes_intersect <- intersect(common_genes_gtex, common_genes_spatial)
+
+venn.diagram(
+  list(
+    constrained = common_genes_gtex,
+    lung = common_genes_spatial),
+  filename = "../figures/venns/venn_constrained_unconstrained_intersect_gene_cis.tiff",
+  category.names = c("", ""),
+  fill = c("#CFB5B8", "#AB8F95"),
+  units = "mm", main.cex = 2, main.fontfamily = "sans",
+  imagetype = "tiff", lwd = 0.1, alpha = 1,
+  width = 25, height = 25)
+```
+
+## Figure 2b: Opposite DRA-eQTLs in the lung and blood
+```{r}
+common_effects <-  afc %>% 
+  filter(gene %in% setdiff(common_genes_gtex, common_genes_spatial) & 
+           method == "GTEx") %>% 
+  mutate(category = "unconstrained") %>% 
+  bind_rows(
+    afc %>% 
+      filter(gene %in% setdiff(common_genes_spatial, common_genes_gtex) & 
+               method == "Spatial") %>% 
+      mutate(category = "constrained")) %>% 
+  bind_rows(
+    afc %>% 
+      filter(gene %in% intersect(common_genes_spatial, common_genes_gtex)) %>% 
+      mutate(category = "both")) 
+
+common_effects %>% 
+  left_join(
+    common_effects %>% 
+      distinct(snp, gene, tissue, category, .keep_all = T) %>% 
+      arrange(gene) %>% 
+      rename("effect"="log2_aFC") %>% 
+      select(snp, gene, tissue, category, effect) %>%
+      group_by(gene, tissue, category) %>% 
+      summarise(median_effect = median(effect)) %>% 
+      ungroup() %>% 
+      pivot_wider(names_from = tissue, values_from=median_effect) %>% 
+      mutate(
+        dif = case_when(
+          (Whole_Blood < 0 & Lung > 0) | (Lung < 0 & Whole_Blood > 0) ~ "opposite",
+          (abs(abs(Whole_Blood) - abs(Lung)) >= abs(Whole_Blood)) |  
+            (abs(abs(Whole_Blood) - abs(Lung)) >= abs(Lung)) ~ "double")
+        ) %>%
+      pivot_longer(cols=c(`Whole_Blood`, `Lung`), 
+                   names_to = "tissue", values_to="effect") %>% 
+      mutate(
+        dif = case_when(
+          is.na(dif) ~ "marginal",
+          TRUE ~ as.character(dif))) %>% 
+      distinct(gene, category, dif)) %>% 
+  arrange(gene) %>% 
+  ggplot(aes(x=fct_reorder(gene, log2_aFC), y=log2_aFC))+
+  geom_boxplot(color=color.list$gwas)+
+  geom_point(data= . %>% filter(dif == "opposite"), 
+             aes(x=fct_reorder(gene, log2_aFC), 
+                 y=log2_aFC, color=dif, fill=dif), shape=23, size=2, alpha=.8)+
+  geom_hline(yintercept = 0, linetype="dotted")+
+  scale_color_manual("eQTL effect", values=c(hoiho[4],  hoiho[6]))+
+  scale_fill_manual("eQTL effect", values=c(hoiho[4], hoiho[6]))+
+  coord_flip()+
+  labs(x = "Genes", y="Effect size (log2[aFC])")+
+  theme_minimal()+
+  theme(legend.position = "bottom")+
+  facet_grid(factor(category, 
+                    levels=c("unconstrained", "constrained", "both"))~tissue, 
+             scales="free", space = "free")#+
+  # ggsave("../drugs/figures/effects_common_facet.pdf", 
+  #        width=8, height=6, useDingbats=FALSE)
+
+ 
+
+```
+
+
+
+
+
+# Corticosteroid-linked variants associate with more genes than variants linked with other drug categories
+
+```{r get-lung-dra-eqtls}
+lung.drug.snps <-  list(
+  leukotrienes = unique(
+    (gtex.lung %>% filter(Drug=="anti-leukotriene agents") %>% 
+       bind_rows(
+         spatial.lung %>% filter(Drug=="anti-leukotriene agents")
+       )
+     )$snp
+    ),
+ beta_agonists = unique(
+    (gtex.lung %>% filter(Drug=="beta-agonists") %>% 
+       bind_rows(
+         spatial.lung %>% filter(Drug=="beta-agonists")
+       )
+     )$snp
+    ),
+ corticosteroids = unique(
+    (gtex.lung %>% filter(Drug=="corticosteroids") %>% 
+       bind_rows(
+         spatial.lung %>% filter(Drug=="corticosteroids")
+       )
+     )$snp
+    )
+)
+```
+
+```{r get-blood-dra-eqtls}
+blood.drug.snps <-  list(
+  leukotrienes = unique(
+    (gtex.blood %>% filter(Drug=="anti-leukotriene agents") %>% select(snp) %>% 
+       bind_rows(
+         spatial.blood %>% filter(Drug=="anti-leukotriene agents") %>% select(snp)
+       )
+     )$snp
+    ),
+ beta_agonists = unique(
+    (gtex.blood %>% filter(Drug=="beta-agonists") %>% select(snp) %>% 
+       bind_rows(
+         spatial.blood %>% filter(Drug=="beta-agonists") %>% select(snp)
+       )
+     )$snp
+    ),
+ corticosteroids = unique(
+    (gtex.blood %>% filter(Drug=="corticosteroids") %>% select(snp) %>% 
+       bind_rows(
+         spatial.blood %>% filter(Drug=="corticosteroids") %>% select(snp)
+       )
+     )$snp
+    )
+)
+```
+
+```{r get-lung-dra-genes}
+
+lung.drug.genes <-  list(
+  leukotrienes = unique(
+    (gtex.lung %>% filter(Drug=="anti-leukotriene agents") %>% 
+       bind_rows(
+         spatial.lung %>% filter(Drug=="anti-leukotriene agents")
+       )
+     )$gene
+    ),
+ beta_agonists = unique(
+    (gtex.lung %>% filter(Drug=="beta-agonists") %>% 
+       bind_rows(
+         spatial.lung %>% filter(Drug=="beta-agonists")
+       )
+     )$gene
+    ),
+ corticosteroids = unique(
+    (gtex.lung %>% filter(Drug=="corticosteroids") %>% 
+       bind_rows(
+         spatial.lung %>% filter(Drug=="corticosteroids")
+       )
+     )$gene
+    )
+)
+
+```
+
+```{r get-blood-dra-genes}
+blood.drug.genes <-  list(
+  leukotrienes = unique(
+    (gtex.blood %>% filter(Drug=="anti-leukotriene agents") %>% select(gene) %>% 
+       bind_rows(
+         spatial.blood %>% filter(Drug=="anti-leukotriene agents") %>% select(gene)
+       )
+     )$gene
+    ),
+ beta_agonists = unique(
+    (gtex.blood %>% filter(Drug=="beta-agonists") %>% select(gene) %>% 
+       bind_rows(
+         spatial.blood %>% filter(Drug=="beta-agonists") %>% select(gene)
+       )
+     )$gene
+    ),
+ corticosteroids = unique(
+    (gtex.blood %>% filter(Drug=="corticosteroids") %>% select(gene) %>% 
+       bind_rows(
+         spatial.blood %>% filter(Drug=="corticosteroids") %>% select(gene)
+       )
+     )$gene
+    )
+)
+```
+
+```{r create-dra-eqtls-genes-table}
+drugs.snps.genes <-  tibble(
+  category = c(
+    rep(c("SNPs"), 6),
+    rep(c("Genes"), 6)
+    ),
+  
+  tissue = c(
+    rep(c("Whole_Blood"), 3),
+    rep(c("Lung"), 3),
+    rep(c("Whole_Blood"), 3),
+    rep(c("Lung"), 3)
+    ),
+  
+  drug = c(
+    names(blood.drug.snps),
+    names(blood.drug.snps),
+    names(blood.drug.genes),
+    names(blood.drug.genes)
+    ),
+  n = c(
+    length(blood.drug.snps$leukotrienes), length(blood.drug.snps$beta_agonists), length(blood.drug.snps$corticosteroids),
+    length(lung.drug.snps$leukotrienes), length(lung.drug.snps$beta_agonists), length(lung.drug.snps$corticosteroids),
+    length(blood.drug.genes$leukotrienes), length(blood.drug.genes$beta_agonists), length(blood.drug.genes$corticosteroids),
+    length(lung.drug.genes$leukotrienes), length(lung.drug.genes$beta_agonists), length(lung.drug.genes$corticosteroids)
+   
+    )
+) %>% 
+  mutate(
+   category = paste0(tissue, "_", category) 
+  ) %>% 
+  group_by(category) %>% mutate(perc=n/sum(n)) %>% ungroup() 
+  
+
+```
+
+## Figure 3a: Relationship between DRA-eQTLs and DRA-genes across drug categories and tissues
+```{r plot-dra-eqtls-genes}
+ggplot(drugs.snps.genes,
+       aes(x=factor(category, levels=c("Whole_Blood_SNPs", "Whole_Blood_Genes", "Lung_SNPs", "Lung_Genes")), 
+           y=perc, fill=drug, label=n))+
+  geom_col()+
+  geom_text(position = position_stack(vjust=0.5))+
+  scale_x_discrete("")+
+  scale_fill_viridis_d("", option="D", begin=0.3)+
+  theme_pubclean()#+
+  # ggsave("../drugs/figures/drugs_snps_genes.pdf", width=5, height=5)
+
+```
+
+
+
+```{r df-gene-nearbyness}
+nearest.genes <-  gtex.blood %>% distinct(snp, gene, Drug, match) %>% count(Drug, match) %>% 
+  group_by(Drug) %>% mutate(perc=n/sum(n)) %>% ungroup() %>% 
+  mutate(
+     category = "gtex_blood",
+     match = case_when(
+    match == "unmatched" ~ "gtex_blood",
+    TRUE ~ as.character(match)
+  )) %>%
+  bind_rows(
+    spatial.blood %>% distinct(snp, gene, Drug, match) %>% count(Drug, match) %>% 
+  group_by(Drug) %>% mutate(perc=n/sum(n)) %>% ungroup() %>% 
+  mutate(
+     category = "spatial_blood",
+     match = case_when(
+    match == "unmatched" ~ "spatial_blood",
+    TRUE ~ as.character(match)
+  ))
+  ) %>% 
+  bind_rows(
+    gtex.lung %>% distinct(snp, gene, Drug, match) %>% count(Drug, match) %>% 
+  group_by(Drug) %>% mutate(perc=n/sum(n)) %>% ungroup() %>% 
+  mutate(
+      category = "gtex_lung",
+      match = case_when(
+    match == "unmatched" ~ "gtex_lung",
+    TRUE ~ as.character(match)
+  ))
+  ) %>% 
+  bind_rows(
+    spatial.lung %>% distinct(snp, gene, Drug, match) %>% count(Drug, match) %>% 
+  group_by(Drug) %>% mutate(perc=n/sum(n)) %>% ungroup() %>% 
+  mutate(
+     category = "spatial_lung",
+     match = case_when(
+    match == "unmatched" ~ "spatial_lung",
+    TRUE ~ as.character(match)
+  ))
+  )
+nearest.genes$category = factor(nearest.genes$category, levels = c("gtex_blood", "spatial_blood", "gtex_lung", "spatial_lung"))
+nearest.genes$match = factor(nearest.genes$match, levels=c("matched", "gtex_blood", "spatial_blood", "gtex_lung", "spatial_lung"))
+```
+
+
+```{r nearest-gene-count}
+eqtls %>% 
+  distinct(snp, gene, match) %>% 
+  count(gene, match, name = "n_snps") %>% 
+  count(match, name = "n_genes")
+```
+
+
+## Figure 3b: Compare DRA-eQTL-DRA-gene mapping by drug category
+```{r plot-gene-mapping-by-category}
+ggplot(nearest.genes %>% distinct(),
+  aes(x = category, 
+      y = perc, 
+      fill = match))+
+  geom_col()+
+  geom_text(aes(label = n),  position = position_stack(vjust = .5))+
+   scale_fill_manual("Nearest gene", values = c(color.list$gwas, hoiho[1], hoiho[2], "#CC9999", "#996666"))+
+  scale_y_continuous("Proportion of genes", expand = c(0.01,0))+
+   theme_minimal()+
+  theme(legend.title = element_blank(),
+        legend.position = "bottom",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())+  
+  facet_grid(. ~ Drug)#+
+  # ggsave("../drugs/figures/nearest_genes.pdf", width=8, height=5)
+```
+
+
+## Supplementary Table 6: Average number of genes associated with DRA-eQTLs across drug categories
+```{r write-ave-genes-per-snp}
+eqtls %>% 
+  distinct(snp, gene, tissue, Drug) %>%
+  count(snp, tissue, Drug)  %>% arrange(desc(n)) %>% 
+  group_by(tissue, Drug) %>%
+  summarise(ave_genes_per_snp = round(mean(n), 1)) #%>% 
+  # write_tsv("../analysis/data_tidying/ave_genes_per_snp.txt")
+```
+
+
+
+```{r genes-by-drug-response}
+drugs.genes <-  gtex.blood %>% filter(Drug =="anti-leukotriene agents") %>% 
+  bind_rows(spatial.blood %>% filter(Drug == "anti-leukotriene agents")) %>% 
+  bind_rows(gtex.lung %>% filter(Drug == "anti-leukotriene agents")) %>% 
+  bind_rows(spatial.lung %>% filter(Drug == "anti-leukotriene agents")) %>% 
+  distinct(gene, Drug, tissue) %>% arrange(gene) %>% 
+  bind_rows(
+    gtex.blood %>% filter(Drug =="beta-agonists") %>% 
+    bind_rows(spatial.blood %>% filter(Drug == "beta-agonists")) %>% 
+    bind_rows(gtex.lung %>% filter(Drug == "beta-agonists")) %>% 
+    bind_rows(spatial.lung %>% filter(Drug == "beta-agonists")) %>% 
+    distinct(gene, Drug, tissue) %>% arrange(gene)
+  ) %>% 
+  bind_rows(
+     gtex.blood %>% filter(Drug =="corticosteroids") %>% 
+    bind_rows(spatial.blood %>% filter(Drug == "corticosteroids")) %>% 
+    bind_rows(gtex.lung %>% filter(Drug == "corticosteroids")) %>% 
+    bind_rows(spatial.lung %>% filter(Drug == "corticosteroids")) %>% 
+    distinct(gene, Drug, tissue) %>% arrange(gene)
+  ) #%>% 
+  # write_tsv("../analysis/data_tidying/genes_by_drugs.txt")
+```
+
+## Figure 3c: DRA-genes by drug categories across tissues
+```{r plot-genes-by-tissue-drug}
+drugs.genes %>% 
+  count(Drug, gene, name = "category") %>% 
+  mutate(category = case_when(
+    category == 1 ~ "Single",
+    category == 2 ~ "Both"
+  )) %>%
+  left_join(drugs.genes, by = c("Drug", "gene")) %>% 
+  mutate(
+    tissue = case_when(
+      category == "Both" ~ "Both",
+      TRUE ~ as.character(tissue)
+    )) %>% 
+  distinct() %>% 
+  count(Drug, tissue, name="count") %>% 
+  group_by(Drug) %>% 
+  mutate(perc=count/sum(count)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x=Drug, y=perc, fill=tissue, label = count))+
+  geom_col(position = position_dodge2())+
+  geom_text(position = position_dodge2(width = 0.9), vjust=-0.2)+
+  scale_fill_manual("Occurring tissue", values = c("#aaaaaa", color.list$lung, color.list$blood))+
+  scale_y_continuous("Proportion of genes")+
+  scale_x_discrete("", labels = c("Anti-leukotriene agents", "Beta-agonists", "Corticosteroids"))+
+  theme_minimal()+
+  theme(legend.position = "bottom")#+
+  # ggsave("../drugs/figures/genes_tissue_drug.pdf", width=8, height=5)
+```
+
+
+## Figure 4: PPIN (STRINGDB)
+
+
+
+
+
+
+# Drug interactions
+
+```{r read-drug-interactions, include=FALSE}
+drugs.interactions <- read_tsv("../results/drugbank/drugbank_interactions_results.tsv") %>% 
+  left_join(drugs.genes %>% select(gene, Drug) %>% rename(c("drug_class"= "Drug"))) %>% 
+  mutate(
+    gene = factor(gene, 
+                  levels = c("RDH11", "MAPT", "PRDX5", "FCER2", "PNMT", "NPEPPS", 
+                             "EZH1", "LTA4H", "ABCC1", "CANX", "CHRNA2")))
+
+```
+
+
+```{r write-drug-target-genes}
+# drugs.interactions %>% distinct(gene, drug) %>% 
+#   left_join(
+#     read_tsv("../results/drugbank/drugbank_gene_results.tsv") %>% 
+#       select(drug, target_genes),
+#     by = "drug"
+#   ) %>% 
+#   separate_rows(target_genes, sep = ";") %>% 
+#   distinct(target_genes) #%>% 
+  # write_tsv("../results/drugbank/drugbank_drug_target_genes.txt")
+
+```
+
+
+
+```{r read-gene-drugs, include=FALSE}
+gene_drugs <- read_tsv("../results/drugbank/genes.txt")
+```
+
+
+```{r read-gene-drugs-bootstrap}
+gene_bootstrap <- read_tsv("../results/drugbank/bootstrap_summary.txt", 
+         col_types = cols(sim=col_character())) %>% 
+  mutate(type = "sim") %>% 
+  bind_rows(
+    tibble(sim="study",
+           genes = gene_drugs %>% select(gene) %>% n_distinct(),
+           drugs = gene_drugs %>% select(drug) %>% n_distinct(),
+           type = "study"
+    )
+  )
+
+gene_bootstrap_gene_pval <- gene_bootstrap %>% 
+  filter(type == "sim" & 
+           genes >= gene_drugs %>% select(gene) %>% n_distinct()) %>% nrow() / 
+  gene_bootstrap %>% 
+  filter(type == "sim") %>% nrow()
+
+gene_bootstrap_gene_pval <- ifelse(gene_bootstrap_gene_pval==0, 
+                                   paste0("< ", 1/gene_bootstrap %>% filter(type == "sim") %>% nrow()))
+
+gene_bootstrap_drug_pval <- gene_bootstrap %>% 
+  filter(type == "sim" & drugs >= gene_drugs %>% select(drug) %>% n_distinct()) %>% nrow() / gene_bootstrap %>% 
+  filter(type == "sim") %>% nrow()
+```
+
+
+## Supplementary Figure 4A: 17 DRA-genes targeted by 101 drugs in Drugbank
+```{r plot-gene-drugs-bootstrap}
+gene_bootstrap %>% 
+  ggplot(aes(x=type, y=genes, color=type))+
+  geom_boxplot()+
+  scale_y_continuous("Number of Genes")+
+  scale_x_discrete("")+
+  scale_color_manual(values = c("gray", "black"))+
+  annotate("text", x=1.5, y=18,
+           label = paste0("P-value ", gene_bootstrap_gene_pval))+
+  theme_minimal(base_size=18)+
+  theme(legend.position = "nil")#+
+  # ggsave("../figures/drugs_gene.pdf", width=6, height=5)
+```
+
+
+
+## Supplementary Figure 4B: 101 drugs targeting 103 DRA-genes in Drugbank not likely by chance
+```{r}
+gene_bootstrap %>% 
+  ggplot(aes(x=type, y=drugs, color=type))+
+  geom_boxplot()+
+  scale_y_continuous("Number of Drugs")+
+  scale_x_discrete("")+
+  scale_color_manual(values = c("gray", "black"))+
+  # annotate("text", x=1.5, y=210,
+  #          label = paste0("P-value ", drug_bootstrap_drug_pval))+
+  theme_minimal(base_size=18)+
+  theme(legend.position = "nil")#+
+   # ggsave("../figures/drugs_drug.pdf", width=6, height=5)
+```
+
+
+
+
+```{r druggable-genes-matched}
+#How many druggable genes are not nearest
+gtex.blood %>% 
+  distinct(gene, match, pair) %>% 
+  bind_rows(
+    spatial.blood %>% 
+      distinct(gene, match, pair)
+  ) %>% 
+  bind_rows(
+    gtex.lung %>% 
+      distinct(gene, match, pair)
+  ) %>% 
+  bind_rows(
+    spatial.lung %>% 
+      distinct(gene, match, pair)
+  ) %>% 
+  distinct() %>% 
+  filter(gene %in% gene_drugs$gene) %>% 
+  count(match)
+
+```
+
+
+```{r read-drug-inter-asthma, include=FALSE}
+drug_inter_asthma <- read_tsv("../results/drugbank/asthma_drug_interactions.txt") #%>% 
+drug_inter_asthma %>% 
+  filter(drug_interaction %in% gene_drugs$drug) %>%
+  select(drug) %>% 
+  n_distinct()
+```
+
+```{r read-drug-inter-asthma-bootstrap, include=FALSE}
+drug_inter_bootstrap <- read_tsv("../results/drugbank/bootstrap_summary_drugs.txt",
+                                 col_types = cols(sim=col_character()))
+```
+
+```{r}
+drug_bootstrap <- drug_inter_bootstrap %>% 
+  mutate(type="sim") %>% 
+  bind_rows(
+    tibble(sim="study",
+           asthma_drug=drug_inter_asthma %>% filter(drug_interaction %in% gene_drugs$drug) %>% select(drug) %>% 
+             n_distinct(),
+           inter_drug=drug_inter_asthma %>% 
+             filter(drug_interaction %in% gene_drugs$drug) %>% select(drug_interaction) %>% 
+             n_distinct(),
+           type="study")
+  )
+
+drug_bootstrap_asthma_pval <- drug_inter_bootstrap %>% 
+  filter(asthma_drug >= drug_inter_asthma %>% filter(drug_interaction %in% gene_drugs$drug) %>% 
+           select(drug) %>% n_distinct()) %>% nrow() / drug_inter_bootstrap %>% nrow()
+
+drug_bootstrap_asthma_pval <- ifelse(drug_bootstrap_asthma_pval==0, 
+                                   paste0("< ", 1 / drug_inter_bootstrap %>% nrow()),
+                                   drug_bootstrap_asthma_pval)
+
+drug_bootstrap_inter_pval <- drug_inter_bootstrap %>% 
+  filter(inter_drug >= drug_inter_asthma %>% filter(drug_interaction %in% gene_drugs$drug) %>% 
+           select(drug) %>% n_distinct()) %>% nrow() / 
+           drug_inter_bootstrap %>% nrow()
+
+drug_bootstrap_inter_pval <- ifelse(drug_bootstrap_inter_pval==0, 
+                                   paste0("< ", 1 / drug_inter_bootstrap %>% nrow()),
+                                   drug_bootstrap_inter_pval)
+# 
+# gene_bootstrap_drug_pval <- gene_bootstrap %>% 
+#   filter(type == "sim" & drugs >= gene_drugs %>% select(drug) %>% n_distinct()) %>% nrow() / gene_bootstrap %>% 
+#   filter(type == "sim") %>% nrow()
+```
+
+## Supplementary Figure 4c: 60 drugs DRA-genes targeted by 101 drugs in Drugbank
+```{r}
+drug_bootstrap %>% 
+  ggplot(aes(x=type, y=asthma_drug, color=type))+
+    geom_boxplot()+
+  annotate("text", x=1.5, y=67,
+           label = paste0("P-value ", drug_bootstrap_asthma_pval))+
+  scale_y_continuous("Number of asthma drugs")+
+  scale_x_discrete("")+
+  scale_color_manual(values=c("gray", "black"))+
+    theme_minimal(base_size=18)+
+  theme(legend.position = "nil")#+
+  # ggsave("../figures/drugs_asthma.pdf", width=6, height=5)
+```
+
+## Supplementary Figure 4d: Unlikely that 39 out of a random set of 101 drugs in the Drugbank will have a drug-drug interaction
+```{r}
+drug_bootstrap %>% 
+  ggplot(aes(x=type, y=inter_drug, color=type))+
+  geom_boxplot()+
+  annotate("text", x=1.5, y=42,
+           label = paste0("P-value ", drug_bootstrap_inter_pval))+
+  scale_y_continuous("Number of interacting drugs")+
+  scale_x_discrete("")+
+  scale_color_manual(values=c("gray", "black"))+
+  theme_minimal(base_size=18)+
+  theme(legend.position = "nil")#+
+# ggsave("../figures/drugs_inter_drug.pdf", width=6, height=5)
+```
+
+
+## Supplementary Table 8: Pathway effect
+```{r write-pathway-effect}
+string_asthma_drugs %>% 
+  rename("gene" = "preferredName_B", "asthma_drug_target"="preferredName_A", "asthma_drug"="drug") %>% 
+  inner_join(eqtls %>% select(snp, gene), on= "gene")  %>% 
+  select(snp, gene, asthma_drug, asthma_drug_target) %>% 
+  write_tsv("../analysis/data_tidying/pathway_effect.txt")
+```
+
+
+
+```{r, read-index-icd-codes, include=FALSE}
+codes <- read_csv("../results/comorbidity/indexDiseases.txt", col_names = FALSE)
+comorColors <- list(diseaseColor = "pink", comorColor = "lightblue")
+```
+
+
+```{r}
+index_dx <-  c("J449", "J440", "J441")
+```
+
+```{r, include=FALSE}
+library(icdcoder)
+
+comorAll <- readxl::read_xlsx("../results/comorbidity/comorbidities_asthma.xlsx", 
+                  sheet = "asthma_comorbidities_all") %>% 
+  filter(!(is.na(relativeRisk) | relativeRisk == "NA") &
+           correctedPvalue < 0.05) %>% 
+  select(-disA, -disB)
+comorAll <- comorAll %>%
+  left_join(
+    comorAll %>%
+      select(disAcode) %>%
+      left_join(
+        icd10Hierarchy %>%
+          select(icd10, major, chapter) %>%
+          rename("disA"="major", "disAChap"="chapter"),
+        by = c("disAcode" = "icd10")) %>%
+      bind_cols(
+        comorAll %>%
+          select(disBcode) %>%
+          left_join(
+            icd10Hierarchy %>%
+              select(icd10, major, chapter) %>%
+              rename("disB"="major", "disBChap"="chapter"),
+            by = c("disBcode" = "icd10"))),
+    by = c("disAcode"="disAcode", "disBcode"="disBcode")
+  ) %>%
+   arrange(desc(oddsRatio))
+```
+
+
+
+```{r read-drug-disease-mapping, include=FALSE}
+drug_disease <- read_tsv("../results/drugbank/drug_disease.txt")
+```
+
+
+
+```{r, include=FALSE}
+summ_drug <- gene_drugs %>% 
+  inner_join(eqtls %>% select(snp, gene, match), on="gene") %>%
+  rename("inter_drug"="drug") %>% 
+  inner_join(drug_inter_asthma, by=c("inter_drug"="drug_interaction")) %>% 
+  inner_join(read_tsv("../results/drugbank/asthma_drugs.txt") %>% 
+               select(drug, gene_target) %>% 
+               separate_rows(gene_target, sep=";") ) %>% 
+  rename("asthma_drug"="drug", "asthma_drug_target"="gene_target") %>% 
+  distinct() %>%
+  mutate(category = "Drug-drug interaction") %>%
+  group_by(category) %>%
+  summarise(SNPs=n_distinct(snp),
+              Genes=n_distinct(gene),
+              Asthma_Drugs=n_distinct(asthma_drug),
+              Asthma_Drug_Target=n_distinct(asthma_drug_target),
+            Inter_Drug=n_distinct(inter_drug)
+              ) %>%
+    ungroup() %>%
+    pivot_longer(SNPs:Inter_Drug, names_to="variable", values_to="value")
+```
+
+
+```{r, include=FALSE}
+# Drugs connected to disease but not a comorbidity
+summ_comor <- drug_disease %>% 
+  inner_join(gene_drugs, on="drug") %>% 
+  inner_join(eqtls %>% select(snp, gene), on="gene") %>% 
+  # filter(!(drug %in% comorbid$drug)) %>%
+  select(snp, gene, drug) %>% 
+  rename("inter_drug"="drug") %>% 
+  inner_join(drug_inter_asthma, by=c("inter_drug"="drug_interaction")) %>% 
+  inner_join(read_tsv("../results/drugbank/asthma_drugs.txt") %>% 
+  select(drug, gene_target) %>% 
+  separate_rows(gene_target, sep=";") ) %>% 
+  rename("asthma_drug"="drug", "asthma_drug_target"="gene_target") %>% 
+  distinct() %>% 
+  mutate(category = "Drug") %>% 
+  group_by(category) %>% 
+  summarise(SNPs=n_distinct(snp), 
+              Genes=n_distinct(gene), 
+              Asthma_Drugs=n_distinct(asthma_drug),
+              Asthma_Drug_Target=n_distinct(asthma_drug_target),
+            Inter_Drug=n_distinct(inter_drug)
+              ) %>% 
+    ungroup() %>% 
+    pivot_longer(SNPs:Inter_Drug, names_to="variable", values_to="value")
+
+```
+
+
+
+```{r read-asthma-drugs,  include=FALSE}
+# Drug and SNP affect the same gene
+summ_coloc <- read_tsv("../results/drugbank/asthma_drugs.txt") %>% 
+  inner_join(gene_drugs, on="drug") %>% 
+  inner_join(eqtls %>% select(snp, gene), on="gene") %>% 
+  select(snp, gene, drug) %>% 
+  rename("asthma_drug"="drug") %>%
+  mutate(asthma_drug_target = gene,
+         category = "Direct gene effect") %>% 
+  distinct() %>% 
+  group_by(category) %>% 
+  summarise(SNPs=n_distinct(snp), 
+              Genes=n_distinct(gene), 
+              Asthma_Drugs=n_distinct(asthma_drug),
+              Asthma_Drug_Target=n_distinct(asthma_drug_target),
+              ) %>% 
+    ungroup() %>% 
+    pivot_longer(SNPs:Asthma_Drug_Target, names_to="variable", values_to="value")
+# summ_coloc
+```
+
+```{r, read-string-asthma-drugs, include=FALSE}
+#Targets of asthma drugs that interact with eGenes.
+string_asthma_drugs <- read_tsv("../results/drugbank/string_asthma_drugs.txt") #%>% 
+  
+summ_ppi <- string_asthma_drugs %>% 
+  rename("gene" = "preferredName_B", "asthma_drug_target"="preferredName_A", "asthma_drug"="drug") %>% 
+  inner_join(eqtls %>% select(snp, gene), on= "gene")  %>% 
+  select(snp, gene, asthma_drug, asthma_drug_target) %>% 
+    mutate(category="Protein-protein interaction") %>% 
+  distinct() %>% 
+    group_by(category) %>% 
+    summarise(SNPs=n_distinct(snp), 
+              Genes=n_distinct(gene), 
+              Asthma_Drugs=n_distinct(asthma_drug),
+              Asthma_Drug_Target=n_distinct(asthma_drug_target),
+              ) %>% 
+    ungroup() %>% 
+    pivot_longer(SNPs:Asthma_Drug_Target, names_to="variable", values_to="value")
+```
+
+
+## Figure 5D,E,F: Genetic mechanisms underlying variability in response to drugs in asthma
+```{r plot-}
+summ_drug %>% 
+  bind_rows(summ_coloc) %>% 
+  bind_rows(summ_ppi) %>% 
+  group_by(category) %>% 
+  ggplot(aes(x=factor(variable, levels=c("SNPs", "Genes", "Inter_Drug", "Asthma_Drugs", "Asthma_Drug_Target")),
+             y=value, 
+             fill=factor(variable, levels=c("SNPs", "Genes", "Inter_Drug", "Asthma_Drugs", "Asthma_Drug_Target")),
+             label = value)) +
+  geom_col()+
+  geom_text(nudge_y = 2)+
+  scale_fill_manual(values=c("gray", "#996699", "#99cc99", "#cccc33", "#0099cc"))+
+  # coord_flip()+
+  labs(x="", y="Number", fill="")+
+  facet_grid(. ~ factor(category, c("Direct gene effect", 
+                                    "Protein-protein interaction", 
+                                    "Drug-drug interaction")))+
+  theme_minimal()+
+  theme(axis.text.x = element_blank(),
+        legend.position = "bottom")#+
+  # ggsave("../figures/mechanisms_summ.pdf", width=8, height=4)
+
+
+
+```
+
+
+# The comorbidity effect
+
+## Supplementary Table 11: Treatments of comorbidities that could interfere with the action of asthma drugs
+```{r write-comorbidity-drug-interactions}
+gene_drugs %>% 
+  inner_join(eqtls %>% select(snp, gene, match), on="gene") %>%
+  rename("inter_drug"="drug") %>% 
+  inner_join(drug_inter_asthma, by=c("inter_drug"="drug_interaction")) %>%
+  inner_join(drug_disease, by=c("inter_drug"="drug")) %>% 
+  mutate(threedigit = substr(icd, 1,3)) %>% 
+  inner_join(comorAll %>% 
+               mutate(threedigit = substr(disBcode, 1,3)),
+             by="threedigit") %>%
+  arrange(desc(relativeRisk)) %>% 
+  select(-disAChap, -disBChap, -match, -inchikey, -atc_code) %>% 
+  write_tsv("../results/comorbidity/comorbid_drugs.txt")
+
+```
+
+
+
+## Figure 6: Relative risk of comorbid conditions in 26,781 asthma patients whose treatment could interfere with the action of asthma drugs
+```{r plot-comorbidity-effect}
+gene_drugs %>% 
+  inner_join(eqtls %>% select(snp, gene, match), on="gene") %>%
+  rename("inter_drug"="drug") %>% 
+  inner_join(drug_inter_asthma, by=c("inter_drug"="drug_interaction")) %>%
+  inner_join(drug_disease, by=c("inter_drug"="drug")) %>%
+  mutate(threedigit = substr(icd, 1,3)) %>%
+  inner_join(comorAll %>%
+               mutate(threedigit = substr(disAcode, 1,3)),
+             by="threedigit") %>%
+  distinct(gene, snp, match, indication, inter_drug, drug, relativeRisk, disA, threedigit, interaction_desc) %>%
+  mutate(disA = paste0(disA, " - ", threedigit),
+         relativeRisk = as.numeric(relativeRisk)) %>%
+  rename("drug_target" = "gene",
+         "asthma_drug" = "drug",
+         "drug" = "inter_drug",
+         "drug_indication" = "indication",
+         "comorbidity" = "disA") %>% 
+  select(drug, asthma_drug, interaction_desc, drug_target, drug_indication,
+         comorbidity, relativeRisk) %>%
+  distinct() %>% 
+  write_tsv("../analysis/data_tidying/comorbidity_effect.txt") %>% 
+  
+  ggplot(aes(x=fct_reorder(comorbidity, relativeRisk, .desc = F), y=as.numeric(relativeRisk)))+
+  geom_boxplot()+
+  coord_flip()+
+  geom_hline(yintercept = 1, linetype="dashed", color="red")+
+  theme_minimal()+
+  labs(x="", y="Relative risk")+
+  scale_y_continuous(limits = c(0, 8), breaks = seq(0,10,2))+
+# theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+  ggsave("../figures/drugs_disease.pdf", height=8, width=7)
+
+```
+
+
+
+
+
+
+

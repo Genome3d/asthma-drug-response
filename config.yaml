@@ -1,0 +1,44 @@
+data:
+    GTEx: data/GTEx_Analysis_v8_eQTL/
+    gwas: data/gwas-association-downloaded_2020-07-21-EFO_0010638-withChildTraits.tsv
+    expression: data/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_median_tpm.gct.gz
+    gencode: data/gencode.v26.GRCh38.genes.gtf
+    loeuf: data/gnomad.v2.1.1.lof_metrics.by_gene.txt.bgz
+    dice: data/dice/
+    drugbank: 'data/drugbank/full database.xml'
+
+analysis:
+    snps: analysis/drug_response_combined_curated.txt
+    gwas_snps: analysis/gwas.txt
+    combined_snps: analysis/drug_response_combined_curated.txt
+    curated_snps: analysis/drug_response_combined_curated_resolved_gene_range.txt
+    genes_by_drugs: analysis/genes_by_drugs.txt
+
+results:
+    eqtls: results/eqtls/
+    constrained_eqtls: results/eqtls/constrained/
+    unconstrained_eqtls: results/eqtls/unconstrained/
+    unconstrained_afc: results/eqtls/unconstrained/eqtls_afc.txt
+    unconstrained_for_afc: results/eqtls/unconstrained/eqtls_for_afc.txt
+    annotations_snps: results/haploreg/drug_response_combined_haploreg.txt
+    annotations_genes: results/gencode/gene_annotations.txt
+    loeuf: results/loeuf.txt
+    dice: results/dice.txt
+    population: results/population.txt
+    drugbank: results/drugbank/
+    druggable_genes: results/drugbank/genes.tsv
+    asthma_drugs: results/drugbank/asthma_drugs.txt
+    drugs: results/drugbank/drugs.txt
+    drug_disease: results/drugbank/drug_disease.txt
+    asthma_drug_interactions: results/drugbank/asthma_drug_interactions.txt
+    bootstrap_drugs: results/drugbank/bootstrap_summary_drugs.txt
+    bootstrap_genes: results/drugbank/bootstrap_summary.txt
+    string_dir: results/stringdb/
+    asthma_drugs_ppi: results/stringdb/string_asthma_drugs.txt
+    asthma_drugs_ppi_bootstrap: results/stringdb/string_asthma_drugs.txt
+
+
+tissues:
+    lung: Lung
+    blood: Whole_Blood
+    list: ["Lung", "Whole_Blood"]
